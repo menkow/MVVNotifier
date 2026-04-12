@@ -1,0 +1,24 @@
+[Unit]
+Description=Notify Bot - Telegram notification service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=notify-bot
+WorkingDirectory=/opt/notify-bot
+ExecStart=/opt/notify-bot/notify-bot
+Restart=always
+RestartSec=5
+
+Environment=NOTIFY_BOT_TOKEN=YOUR_BOT_TOKEN_HERE
+
+# hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/notify-bot
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
