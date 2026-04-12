@@ -141,7 +141,7 @@ type TG struct {
 func NewTG(token string) *TG {
 	return &TG{
 		token:  token,
-		client: &http.Client{Timeout: 10 * time.Second},
+		client: &http.Client{Timeout: 35 * time.Second},
 	}
 }
 
