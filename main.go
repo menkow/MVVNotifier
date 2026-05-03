@@ -532,16 +532,20 @@ func main() {
 	tg := NewTG(cfg.BotToken)
 	store := NewStore("subscribers.json")
 	notifyLimiter := newBucket(60, time.Second) // 60 req/min global, lazy refill
+	askReg := newPendingRegistry()
 
 	log.Printf("notify-bot starting on :%d (%d subscribers)", cfg.HTTPPort, store.Count())
 
 	// bot polling goroutine
-	go pollBot(tg, store)
+	go pollBot(tg, store, askReg)
 
 	// HTTP server
 	mux := http.NewServeMux()
 	mux.HandleFunc("/notify", func(w http.ResponseWriter, r *http.Request) {
 		handleNotify(w, r, tg, store, notifyLimiter)
+	})
+	mux.HandleFunc("/ask", func(w http.ResponseWriter, r *http.Request) {
+		handleAsk(w, r, tg, store, notifyLimiter, askReg)
 	})
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
@@ -569,7 +573,8 @@ func main() {
 	}
 }
 
-func pollBot(tg *TG, store *Store) {
+func pollBot(tg *TG, store *Store, asks *pendingRegistry) {
+	_ = asks // populated in tasks 7-9
 	var offset int64
 	for {
 		updates, err := tg.GetUpdates(offset)
