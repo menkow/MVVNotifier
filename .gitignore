@@ -2,3 +2,4 @@ notify-bot
 notify-bot.exe
 config.json
 subscribers.json
+.env
