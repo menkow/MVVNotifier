@@ -254,6 +254,48 @@ func escapeHTML(s string) string {
 	return s
 }
 
+// --- Rate Limiter ---
+
+type bucket struct {
+	mu         sync.Mutex
+	tokens     float64
+	capacity   float64
+	refillRate float64 // tokens per second
+	lastRefill time.Time
+}
+
+// newBucket builds a token bucket. perToken is how long it takes to
+// regenerate one token. e.g. (60, time.Second) → capacity 60, 1 token/sec.
+func newBucket(capacity int, perToken time.Duration) *bucket {
+	return &bucket{
+		tokens:     float64(capacity),
+		capacity:   float64(capacity),
+		refillRate: 1.0 / perToken.Seconds(),
+		lastRefill: time.Now(),
+	}
+}
+
+func (b *bucket) allow() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	now := time.Now()
+	elapsed := now.Sub(b.lastRefill).Seconds()
+	if elapsed > 0 {
+		b.tokens += elapsed * b.refillRate
+		if b.tokens > b.capacity {
+			b.tokens = b.capacity
+		}
+		b.lastRefill = now
+	}
+
+	if b.tokens >= 1 {
+		b.tokens -= 1
+		return true
+	}
+	return false
+}
+
 // --- Main ---
 
 func main() {
