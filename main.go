@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/base32"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -181,16 +183,100 @@ func (t *TG) Send(chatID int64, text string) error {
 	return err
 }
 
+// SendWithKeyboard sends an HTML-formatted message with optional inline buttons.
+// Each button's label is also its callback_data — keeps things simple.
+// Returns the message_id of the sent message (used for reply-to routing).
+func (t *TG) SendWithKeyboard(chatID int64, text string, buttons []string) (int64, error) {
+	payload := map[string]any{
+		"chat_id":    chatID,
+		"text":       text,
+		"parse_mode": "HTML",
+	}
+	if len(buttons) > 0 {
+		row := make([]map[string]string, 0, len(buttons))
+		for _, b := range buttons {
+			row = append(row, map[string]string{"text": b, "callback_data": b})
+		}
+		payload["reply_markup"] = map[string]any{
+			"inline_keyboard": [][]map[string]string{row},
+		}
+	}
+	raw, err := t.api("sendMessage", payload)
+	if err != nil {
+		return 0, err
+	}
+	var sent struct {
+		MessageID int64 `json:"message_id"`
+	}
+	if err := json.Unmarshal(raw, &sent); err != nil {
+		return 0, err
+	}
+	return sent.MessageID, nil
+}
+
+// AnswerCallbackQuery acknowledges a button press so Telegram stops the loading
+// spinner. Telegram requires this within 30 seconds.
+func (t *TG) AnswerCallbackQuery(callbackID string) error {
+	_, err := t.api("answerCallbackQuery", map[string]any{
+		"callback_query_id": callbackID,
+	})
+	return err
+}
+
+// EditMessageRemoveKeyboard rewrites the question message: replaces text with
+// finalText and removes any inline keyboard, so the user can't answer twice.
+func (t *TG) EditMessageRemoveKeyboard(chatID, messageID int64, finalText string) error {
+	_, err := t.api("editMessageText", map[string]any{
+		"chat_id":      chatID,
+		"message_id":   messageID,
+		"text":         finalText,
+		"parse_mode":   "HTML",
+		"reply_markup": map[string]any{"inline_keyboard": [][]any{}},
+	})
+	return err
+}
+
+// tgSender is the subset of TG operations needed by handleAsk. It exists so
+// tests can supply a fake without hitting the real Telegram API. *TG already
+// satisfies it through the methods above.
+type tgSender interface {
+	SendWithKeyboard(chatID int64, text string, buttons []string) (int64, error)
+	AnswerCallbackQuery(callbackID string) error
+	EditMessageRemoveKeyboard(chatID, messageID int64, finalText string) error
+}
+
 type Update struct {
-	UpdateID int64 `json:"update_id"`
-	Message  *struct {
-		Chat struct {
-			ID        int64  `json:"id"`
-			FirstName string `json:"first_name"`
-			Username  string `json:"username"`
-		} `json:"chat"`
-		Text string `json:"text"`
-	} `json:"message"`
+	UpdateID      int64          `json:"update_id"`
+	Message       *Message       `json:"message"`
+	CallbackQuery *CallbackQuery `json:"callback_query"`
+}
+
+type Message struct {
+	MessageID      int64      `json:"message_id"`
+	Chat           Chat       `json:"chat"`
+	Text           string     `json:"text"`
+	ReplyToMessage *ReplyMeta `json:"reply_to_message"`
+}
+
+type Chat struct {
+	ID        int64  `json:"id"`
+	FirstName string `json:"first_name"`
+	Username  string `json:"username"`
+}
+
+type ReplyMeta struct {
+	MessageID int64 `json:"message_id"`
+}
+
+type CallbackQuery struct {
+	ID      string           `json:"id"`
+	Data    string           `json:"data"`
+	Message *CallbackMessage `json:"message"`
+}
+
+type CallbackMessage struct {
+	MessageID int64 `json:"message_id"`
+	Chat      Chat  `json:"chat"`
 }
 
 func (t *TG) GetUpdates(offset int64) ([]Update, error) {
@@ -301,6 +387,138 @@ func (b *bucket) allow() bool {
 	return false
 }
 
+// --- Ask Helpers ---
+
+func newAskID() string {
+	var b [5]byte
+	_, _ = rand.Read(b[:])
+	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b[:]))
+}
+
+func clampTimeout(t int) time.Duration {
+	if t < 5 {
+		t = 300 // default when missing/invalid
+	}
+	if t > 600 {
+		t = 600
+	}
+	return time.Duration(t) * time.Second
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
+// --- Ask Request ---
+
+type askReq struct {
+	Text    string   `json:"text"`
+	Timeout int      `json:"timeout"`
+	Buttons []string `json:"buttons"`
+	Level   string   `json:"level"`
+	Title   string   `json:"title"`
+	Service string   `json:"service"`
+}
+
+func parseAskRequest(r *http.Request) (askReq, error) {
+	var req askReq
+	if r.Method == http.MethodPost {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			return req, err
+		}
+		return req, nil
+	}
+	// GET: pull from query string
+	q := r.URL.Query()
+	req.Text = q.Get("text")
+	req.Level = q.Get("level")
+	req.Title = q.Get("title")
+	req.Service = q.Get("service")
+	req.Buttons = q["button"]
+	if t := q.Get("timeout"); t != "" {
+		if v, err := strconv.Atoi(t); err == nil {
+			req.Timeout = v
+		}
+	}
+	return req, nil
+}
+
+// --- Ask Registry ---
+
+type askResult struct {
+	answer string
+	via    string // "button" | "reply" | "text"
+}
+
+type pendingQ struct {
+	id       string
+	msgID    int64
+	answerCh chan askResult
+	deadline time.Time
+}
+
+type pendingRegistry struct {
+	mu    sync.Mutex
+	id2q  map[string]*pendingQ
+	msg2q map[int64]*pendingQ
+}
+
+func newPendingRegistry() *pendingRegistry {
+	return &pendingRegistry{
+		id2q:  make(map[string]*pendingQ),
+		msg2q: make(map[int64]*pendingQ),
+	}
+}
+
+func (r *pendingRegistry) add(p *pendingQ) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.id2q[p.id] = p
+	r.msg2q[p.msgID] = p
+}
+
+func (r *pendingRegistry) remove(p *pendingQ) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.id2q, p.id)
+	delete(r.msg2q, p.msgID)
+}
+
+func (r *pendingRegistry) byID(id string) *pendingQ {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.id2q[id]
+}
+
+func (r *pendingRegistry) byMsg(msgID int64) *pendingQ {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.msg2q[msgID]
+}
+
+func (r *pendingRegistry) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.id2q)
+}
+
+// onlyOne returns the sole pending question if there is exactly one,
+// otherwise nil. Used by the sequential-fallback path in pollBot.
+func (r *pendingRegistry) onlyOne() *pendingQ {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.id2q) != 1 {
+		return nil
+	}
+	for _, p := range r.id2q {
+		return p
+	}
+	return nil
+}
+
 // --- Main ---
 
 func main() {
@@ -314,16 +532,20 @@ func main() {
 	tg := NewTG(cfg.BotToken)
 	store := NewStore("subscribers.json")
 	notifyLimiter := newBucket(60, time.Second) // 60 req/min global, lazy refill
+	askReg := newPendingRegistry()
 
 	log.Printf("notify-bot starting on :%d (%d subscribers)", cfg.HTTPPort, store.Count())
 
 	// bot polling goroutine
-	go pollBot(tg, store)
+	go pollBot(tg, store, askReg)
 
 	// HTTP server
 	mux := http.NewServeMux()
 	mux.HandleFunc("/notify", func(w http.ResponseWriter, r *http.Request) {
 		handleNotify(w, r, tg, store, notifyLimiter)
+	})
+	mux.HandleFunc("/ask", func(w http.ResponseWriter, r *http.Request) {
+		handleAsk(w, r, tg, store, notifyLimiter, askReg)
 	})
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
@@ -351,7 +573,70 @@ func main() {
 	}
 }
 
-func pollBot(tg *TG, store *Store) {
+func routeCallback(tg tgSender, reg *pendingRegistry, cq *CallbackQuery) {
+	if cq.Message == nil {
+		_ = tg.AnswerCallbackQuery(cq.ID)
+		return
+	}
+	p := reg.byMsg(cq.Message.MessageID)
+	_ = tg.AnswerCallbackQuery(cq.ID)
+	if p == nil {
+		return // stale button press
+	}
+	select {
+	case p.answerCh <- askResult{answer: cq.Data, via: "button"}:
+	default:
+	}
+	_ = tg.EditMessageRemoveKeyboard(
+		cq.Message.Chat.ID, cq.Message.MessageID,
+		fmt.Sprintf("✅ Answered: %s", escapeHTML(cq.Data)),
+	)
+}
+
+// routeReply tries to resolve a pending /ask via reply-to. Returns true if
+// the message was consumed by the routing layer (and pollBot should `continue`).
+func routeReply(tg tgSender, reg *pendingRegistry, msg *Message) bool {
+	if msg.ReplyToMessage == nil {
+		return false
+	}
+	p := reg.byMsg(msg.ReplyToMessage.MessageID)
+	if p == nil {
+		return false
+	}
+	select {
+	case p.answerCh <- askResult{answer: msg.Text, via: "reply"}:
+	default:
+	}
+	_ = tg.EditMessageRemoveKeyboard(
+		msg.Chat.ID, msg.ReplyToMessage.MessageID,
+		fmt.Sprintf("✅ Answered: %s", escapeHTML(truncate(msg.Text, 80))),
+	)
+	return true
+}
+
+// routeSequential consumes a plain text message into the sole pending /ask
+// (if there is exactly one). Slash commands always fall through to the
+// existing /start, /stop, /help, /status handlers.
+func routeSequential(tg tgSender, reg *pendingRegistry, msg *Message) bool {
+	if strings.HasPrefix(msg.Text, "/") {
+		return false
+	}
+	p := reg.onlyOne()
+	if p == nil {
+		return false
+	}
+	select {
+	case p.answerCh <- askResult{answer: msg.Text, via: "text"}:
+	default:
+	}
+	_ = tg.EditMessageRemoveKeyboard(
+		msg.Chat.ID, p.msgID,
+		fmt.Sprintf("✅ Answered: %s", escapeHTML(truncate(msg.Text, 80))),
+	)
+	return true
+}
+
+func pollBot(tg *TG, store *Store, asks *pendingRegistry) {
 	var offset int64
 	for {
 		updates, err := tg.GetUpdates(offset)
@@ -362,11 +647,23 @@ func pollBot(tg *TG, store *Store) {
 		}
 		for _, u := range updates {
 			offset = u.UpdateID + 1
+			if u.CallbackQuery != nil {
+				routeCallback(tg, asks, u.CallbackQuery)
+				continue
+			}
 			if u.Message == nil {
 				continue
 			}
 			chatID := u.Message.Chat.ID
 			cmd := strings.TrimSpace(u.Message.Text)
+
+			if routeReply(tg, asks, u.Message) {
+				continue
+			}
+
+			if routeSequential(tg, asks, u.Message) {
+				continue
+			}
 
 			switch {
 			case cmd == "/start":
@@ -447,6 +744,100 @@ func handleNotify(w http.ResponseWriter, r *http.Request, tg *TG, store *Store, 
 		"failed": failed,
 		"total":  len(subs),
 	})
+}
+
+func handleAsk(w http.ResponseWriter, r *http.Request, tg tgSender, store *Store, limiter *bucket, reg *pendingRegistry) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, `{"error":"GET or POST only"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	req, err := parseAskRequest(r)
+	if err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Text == "" {
+		http.Error(w, `{"error":"text is required"}`, http.StatusBadRequest)
+		return
+	}
+	if len(req.Buttons) > 6 {
+		http.Error(w, `{"error":"too many buttons","max":6}`, http.StatusBadRequest)
+		return
+	}
+
+	if !limiter.allow() {
+		w.Header().Set("Retry-After", "1")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":"rate limit exceeded","limit":"60/min"}`))
+		return
+	}
+
+	if reg.count() >= 5 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":"too many concurrent questions","limit":5}`))
+		return
+	}
+
+	timeoutDur := clampTimeout(req.Timeout)
+
+	body := Notification{Text: req.Text, Title: req.Title, Level: req.Level, Service: req.Service}.Format()
+	if len(req.Buttons) == 0 {
+		body += "\n\n<i>(Reply to this message or type your answer)</i>"
+	}
+
+	subs := store.List()
+	if len(subs) == 0 {
+		http.Error(w, `{"error":"no subscribers"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	first := subs[0]
+	msgID, err := tg.SendWithKeyboard(first, body, req.Buttons)
+	if err != nil {
+		log.Printf("ask: send failed for %d: %v", first, err)
+		http.Error(w, `{"error":"send failed"}`, http.StatusBadGateway)
+		return
+	}
+
+	p := &pendingQ{
+		id:       newAskID(),
+		msgID:    msgID,
+		answerCh: make(chan askResult, 1),
+		deadline: time.Now().Add(timeoutDur),
+	}
+	reg.add(p)
+	defer reg.remove(p)
+
+	for _, chatID := range subs[1:] {
+		if _, err := tg.SendWithKeyboard(chatID, body, req.Buttons); err != nil {
+			log.Printf("ask: extra-send failed for %d: %v", chatID, err)
+		}
+	}
+
+	start := time.Now()
+	timer := time.NewTimer(timeoutDur)
+	defer timer.Stop()
+
+	select {
+	case res := <-p.answerCh:
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"answer": res.answer,
+			"via":    res.via,
+			"ms":     time.Since(start).Milliseconds(),
+		})
+	case <-timer.C:
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusRequestTimeout)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error": "timeout",
+			"ms":    timeoutDur.Milliseconds(),
+		})
+	}
 }
 
 // --- CLI Send Mode ---
