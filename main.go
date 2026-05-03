@@ -87,8 +87,13 @@ func (s *Store) load() {
 	}
 }
 
+// save assumes the caller already holds s.mu. It must not call any other
+// Store method that locks, otherwise sync.RWMutex (non-reentrant) deadlocks.
 func (s *Store) save() {
-	ids := s.List()
+	ids := make([]int64, 0, len(s.subs))
+	for id := range s.subs {
+		ids = append(ids, id)
+	}
 	data, _ := json.Marshal(ids)
 	os.WriteFile(s.path, data, 0644)
 }
@@ -254,6 +259,48 @@ func escapeHTML(s string) string {
 	return s
 }
 
+// --- Rate Limiter ---
+
+type bucket struct {
+	mu         sync.Mutex
+	tokens     float64
+	capacity   float64
+	refillRate float64 // tokens per second
+	lastRefill time.Time
+}
+
+// newBucket builds a token bucket. perToken is how long it takes to
+// regenerate one token. e.g. (60, time.Second) → capacity 60, 1 token/sec.
+func newBucket(capacity int, perToken time.Duration) *bucket {
+	return &bucket{
+		tokens:     float64(capacity),
+		capacity:   float64(capacity),
+		refillRate: 1.0 / perToken.Seconds(),
+		lastRefill: time.Now(),
+	}
+}
+
+func (b *bucket) allow() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	now := time.Now()
+	elapsed := now.Sub(b.lastRefill).Seconds()
+	if elapsed > 0 {
+		b.tokens += elapsed * b.refillRate
+		if b.tokens > b.capacity {
+			b.tokens = b.capacity
+		}
+		b.lastRefill = now
+	}
+
+	if b.tokens >= 1 {
+		b.tokens -= 1
+		return true
+	}
+	return false
+}
+
 // --- Main ---
 
 func main() {
@@ -266,6 +313,7 @@ func main() {
 	cfg := loadConfig()
 	tg := NewTG(cfg.BotToken)
 	store := NewStore("subscribers.json")
+	notifyLimiter := newBucket(60, time.Second) // 60 req/min global, lazy refill
 
 	log.Printf("notify-bot starting on :%d (%d subscribers)", cfg.HTTPPort, store.Count())
 
@@ -275,7 +323,7 @@ func main() {
 	// HTTP server
 	mux := http.NewServeMux()
 	mux.HandleFunc("/notify", func(w http.ResponseWriter, r *http.Request) {
-		handleNotify(w, r, tg, store)
+		handleNotify(w, r, tg, store, notifyLimiter)
 	})
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
@@ -285,7 +333,7 @@ func main() {
 	})
 
 	server := &http.Server{
-		Addr:    fmt.Sprintf("127.0.0.1:%d", cfg.HTTPPort),
+		Addr:    fmt.Sprintf(":%d", cfg.HTTPPort),
 		Handler: mux,
 	}
 
@@ -347,9 +395,17 @@ func pollBot(tg *TG, store *Store) {
 	}
 }
 
-func handleNotify(w http.ResponseWriter, r *http.Request, tg *TG, store *Store) {
+func handleNotify(w http.ResponseWriter, r *http.Request, tg *TG, store *Store, limiter *bucket) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"POST only"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !limiter.allow() {
+		w.Header().Set("Retry-After", "1")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":"rate limit exceeded","limit":"60/min"}`))
 		return
 	}
 
