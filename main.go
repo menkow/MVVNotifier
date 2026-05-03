@@ -614,6 +614,28 @@ func routeReply(tg tgSender, reg *pendingRegistry, msg *Message) bool {
 	return true
 }
 
+// routeSequential consumes a plain text message into the sole pending /ask
+// (if there is exactly one). Slash commands always fall through to the
+// existing /start, /stop, /help, /status handlers.
+func routeSequential(tg tgSender, reg *pendingRegistry, msg *Message) bool {
+	if strings.HasPrefix(msg.Text, "/") {
+		return false
+	}
+	p := reg.onlyOne()
+	if p == nil {
+		return false
+	}
+	select {
+	case p.answerCh <- askResult{answer: msg.Text, via: "text"}:
+	default:
+	}
+	_ = tg.EditMessageRemoveKeyboard(
+		msg.Chat.ID, p.msgID,
+		fmt.Sprintf("✅ Answered: %s", escapeHTML(truncate(msg.Text, 80))),
+	)
+	return true
+}
+
 func pollBot(tg *TG, store *Store, asks *pendingRegistry) {
 	var offset int64
 	for {
@@ -636,6 +658,10 @@ func pollBot(tg *TG, store *Store, asks *pendingRegistry) {
 			cmd := strings.TrimSpace(u.Message.Text)
 
 			if routeReply(tg, asks, u.Message) {
+				continue
+			}
+
+			if routeSequential(tg, asks, u.Message) {
 				continue
 			}
 

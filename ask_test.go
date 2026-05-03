@@ -402,3 +402,47 @@ func TestRouteReply_NoMatch_FallsThrough(t *testing.T) {
 		t.Fatal("routeReply should return false when no pending matches")
 	}
 }
+
+func TestRouteSequential_Resolves(t *testing.T) {
+	reg := newPendingRegistry()
+	tg := newFakeTG()
+	p := &pendingQ{id: "x", msgID: 7777, answerCh: make(chan askResult, 1)}
+	reg.add(p)
+
+	msg := &Message{MessageID: 8000, Chat: Chat{ID: 42}, Text: "yes please"}
+	if !routeSequential(tg, reg, msg) {
+		t.Fatal("routeSequential returned false on single-pending plain text")
+	}
+
+	select {
+	case res := <-p.answerCh:
+		if res.answer != "yes please" || res.via != "text" {
+			t.Fatalf("res = %+v", res)
+		}
+	default:
+		t.Fatal("not resolved")
+	}
+}
+
+func TestRouteSequential_SkipsCommands(t *testing.T) {
+	reg := newPendingRegistry()
+	tg := newFakeTG()
+	reg.add(&pendingQ{id: "x", msgID: 7777, answerCh: make(chan askResult, 1)})
+
+	msg := &Message{MessageID: 8000, Chat: Chat{ID: 42}, Text: "/start"}
+	if routeSequential(tg, reg, msg) {
+		t.Fatal("slash commands should not be consumed by sequential fallback")
+	}
+}
+
+func TestRouteSequential_SkipsWhenMultiplePending(t *testing.T) {
+	reg := newPendingRegistry()
+	tg := newFakeTG()
+	reg.add(&pendingQ{id: "a", msgID: 1, answerCh: make(chan askResult, 1)})
+	reg.add(&pendingQ{id: "b", msgID: 2, answerCh: make(chan askResult, 1)})
+
+	msg := &Message{MessageID: 8000, Chat: Chat{ID: 42}, Text: "yes"}
+	if routeSequential(tg, reg, msg) {
+		t.Fatal("with 2 pending, plain text must not auto-resolve")
+	}
+}
