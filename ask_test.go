@@ -47,6 +47,22 @@ func TestPendingQRegistry_Remove(t *testing.T) {
 	}
 }
 
+func TestPendingQRegistry_TryReserve(t *testing.T) {
+	reg := newPendingRegistry()
+	for i := 0; i < 5; i++ {
+		if !reg.tryReserve() {
+			t.Fatalf("tryReserve %d should succeed", i+1)
+		}
+	}
+	if reg.tryReserve() {
+		t.Fatal("tryReserve 6th should fail (cap=5)")
+	}
+	reg.release()
+	if !reg.tryReserve() {
+		t.Fatal("tryReserve after release should succeed")
+	}
+}
+
 func TestPendingQRegistry_OnlyOne(t *testing.T) {
 	reg := newPendingRegistry()
 	if reg.onlyOne() != nil {
@@ -206,11 +222,9 @@ func TestHandleAsk_TooManyButtons(t *testing.T) {
 func TestHandleAsk_ConcurrencyCap(t *testing.T) {
 	reg := newPendingRegistry()
 	for i := 0; i < 5; i++ {
-		reg.add(&pendingQ{
-			id:       newAskID(),
-			msgID:    int64(1000 + i),
-			answerCh: make(chan askResult, 1),
-		})
+		if !reg.tryReserve() {
+			t.Fatalf("tryReserve unexpectedly false at i=%d", i)
+		}
 	}
 	tg := newFakeTG()
 	store := NewStore(t.TempDir() + "/subs.json")
