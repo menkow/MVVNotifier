@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -107,5 +110,200 @@ func TestParseAskRequest_GET_NoTimeout(t *testing.T) {
 	}
 	if got.Timeout != 0 {
 		t.Fatalf("Timeout = %d, want 0", got.Timeout)
+	}
+}
+
+// fakeTG records calls and lets the test resolve pending questions externally.
+type fakeTG struct {
+	mu         sync.Mutex
+	sendCalls  int
+	nextMsgID  int64
+	answerAcks []string
+	editFinals map[int64]string
+}
+
+func newFakeTG() *fakeTG {
+	return &fakeTG{nextMsgID: 1000, editFinals: make(map[int64]string)}
+}
+
+func (f *fakeTG) SendWithKeyboard(chatID int64, text string, buttons []string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sendCalls++
+	f.nextMsgID++
+	return f.nextMsgID, nil
+}
+
+func (f *fakeTG) AnswerCallbackQuery(callbackID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.answerAcks = append(f.answerAcks, callbackID)
+	return nil
+}
+
+func (f *fakeTG) EditMessageRemoveKeyboard(chatID, messageID int64, finalText string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.editFinals[messageID] = finalText
+	return nil
+}
+
+func TestHandleAsk_MethodNotAllowed(t *testing.T) {
+	reg := newPendingRegistry()
+	tg := newFakeTG()
+	store := NewStore(t.TempDir() + "/subs.json")
+	store.Add(42)
+	limiter := newBucket(60, time.Second)
+
+	r := httptest.NewRequest(http.MethodPut, "/ask", nil)
+	w := httptest.NewRecorder()
+	handleAsk(w, r, tg, store, limiter, reg)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", w.Code)
+	}
+	if got := w.Header().Get("Allow"); got != "GET, POST" {
+		t.Fatalf("Allow header = %q", got)
+	}
+}
+
+func TestHandleAsk_TextRequired(t *testing.T) {
+	reg := newPendingRegistry()
+	tg := newFakeTG()
+	store := NewStore(t.TempDir() + "/subs.json")
+	store.Add(42)
+	limiter := newBucket(60, time.Second)
+
+	r := httptest.NewRequest(http.MethodPost, "/ask",
+		strings.NewReader(`{"timeout":5}`))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handleAsk(w, r, tg, store, limiter, reg)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestHandleAsk_TooManyButtons(t *testing.T) {
+	reg := newPendingRegistry()
+	tg := newFakeTG()
+	store := NewStore(t.TempDir() + "/subs.json")
+	store.Add(42)
+	limiter := newBucket(60, time.Second)
+
+	body := `{"text":"hi","timeout":5,"buttons":["1","2","3","4","5","6","7"]}`
+	r := httptest.NewRequest(http.MethodPost, "/ask", strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handleAsk(w, r, tg, store, limiter, reg)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestHandleAsk_ConcurrencyCap(t *testing.T) {
+	reg := newPendingRegistry()
+	for i := 0; i < 5; i++ {
+		reg.add(&pendingQ{
+			id:       newAskID(),
+			msgID:    int64(1000 + i),
+			answerCh: make(chan askResult, 1),
+		})
+	}
+	tg := newFakeTG()
+	store := NewStore(t.TempDir() + "/subs.json")
+	store.Add(42)
+	limiter := newBucket(60, time.Second)
+
+	r := httptest.NewRequest(http.MethodPost, "/ask",
+		strings.NewReader(`{"text":"hi","timeout":5}`))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handleAsk(w, r, tg, store, limiter, reg)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", w.Code)
+	}
+	if tg.sendCalls != 0 {
+		t.Fatalf("sendCalls = %d, want 0 (should reject before sending)", tg.sendCalls)
+	}
+}
+
+func TestHandleAsk_TimeoutPath(t *testing.T) {
+	reg := newPendingRegistry()
+	tg := newFakeTG()
+	store := NewStore(t.TempDir() + "/subs.json")
+	store.Add(42)
+	limiter := newBucket(60, time.Second)
+
+	r := httptest.NewRequest(http.MethodPost, "/ask",
+		strings.NewReader(`{"text":"hi","timeout":5}`))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	start := time.Now()
+	handleAsk(w, r, tg, store, limiter, reg)
+	elapsed := time.Since(start)
+
+	if w.Code != http.StatusRequestTimeout {
+		t.Fatalf("status = %d, want 408", w.Code)
+	}
+	if elapsed < 4*time.Second || elapsed > 7*time.Second {
+		t.Fatalf("elapsed = %s, want ~5s", elapsed)
+	}
+	if reg.count() != 0 {
+		t.Fatalf("registry not cleaned, count = %d", reg.count())
+	}
+}
+
+func TestHandleAsk_AnswerPath(t *testing.T) {
+	reg := newPendingRegistry()
+	tg := newFakeTG()
+	store := NewStore(t.TempDir() + "/subs.json")
+	store.Add(42)
+	limiter := newBucket(60, time.Second)
+
+	r := httptest.NewRequest(http.MethodPost, "/ask",
+		strings.NewReader(`{"text":"hi","timeout":30,"buttons":["Yes","No"]}`))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		var p *pendingQ
+		for ctx.Err() == nil {
+			if p = reg.onlyOne(); p != nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if p == nil {
+			t.Errorf("pending never registered")
+			return
+		}
+		p.answerCh <- askResult{answer: "Yes", via: "button"}
+	}()
+
+	handleAsk(w, r, tg, store, limiter, reg)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var resp struct {
+		Answer string `json:"answer"`
+		Via    string `json:"via"`
+		Ms     int64  `json:"ms"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Answer != "Yes" || resp.Via != "button" {
+		t.Fatalf("resp: %+v", resp)
+	}
+	if reg.count() != 0 {
+		t.Fatalf("registry not cleaned")
 	}
 }

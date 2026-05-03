@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/base32"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -234,6 +236,15 @@ func (t *TG) EditMessageRemoveKeyboard(chatID, messageID int64, finalText string
 	return err
 }
 
+// tgSender is the subset of TG operations needed by handleAsk. It exists so
+// tests can supply a fake without hitting the real Telegram API. *TG already
+// satisfies it through the methods above.
+type tgSender interface {
+	SendWithKeyboard(chatID int64, text string, buttons []string) (int64, error)
+	AnswerCallbackQuery(callbackID string) error
+	EditMessageRemoveKeyboard(chatID, messageID int64, finalText string) error
+}
+
 type Update struct {
 	UpdateID      int64          `json:"update_id"`
 	Message       *Message       `json:"message"`
@@ -374,6 +385,31 @@ func (b *bucket) allow() bool {
 		return true
 	}
 	return false
+}
+
+// --- Ask Helpers ---
+
+func newAskID() string {
+	var b [5]byte
+	_, _ = rand.Read(b[:])
+	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b[:]))
+}
+
+func clampTimeout(t int) time.Duration {
+	if t < 5 {
+		t = 300 // default when missing/invalid
+	}
+	if t > 600 {
+		t = 600
+	}
+	return time.Duration(t) * time.Second
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 // --- Ask Request ---
@@ -629,6 +665,100 @@ func handleNotify(w http.ResponseWriter, r *http.Request, tg *TG, store *Store, 
 		"failed": failed,
 		"total":  len(subs),
 	})
+}
+
+func handleAsk(w http.ResponseWriter, r *http.Request, tg tgSender, store *Store, limiter *bucket, reg *pendingRegistry) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, `{"error":"GET or POST only"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	req, err := parseAskRequest(r)
+	if err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Text == "" {
+		http.Error(w, `{"error":"text is required"}`, http.StatusBadRequest)
+		return
+	}
+	if len(req.Buttons) > 6 {
+		http.Error(w, `{"error":"too many buttons","max":6}`, http.StatusBadRequest)
+		return
+	}
+
+	if !limiter.allow() {
+		w.Header().Set("Retry-After", "1")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":"rate limit exceeded","limit":"60/min"}`))
+		return
+	}
+
+	if reg.count() >= 5 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":"too many concurrent questions","limit":5}`))
+		return
+	}
+
+	timeoutDur := clampTimeout(req.Timeout)
+
+	body := Notification{Text: req.Text, Title: req.Title, Level: req.Level, Service: req.Service}.Format()
+	if len(req.Buttons) == 0 {
+		body += "\n\n<i>(Reply to this message or type your answer)</i>"
+	}
+
+	subs := store.List()
+	if len(subs) == 0 {
+		http.Error(w, `{"error":"no subscribers"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	first := subs[0]
+	msgID, err := tg.SendWithKeyboard(first, body, req.Buttons)
+	if err != nil {
+		log.Printf("ask: send failed for %d: %v", first, err)
+		http.Error(w, `{"error":"send failed"}`, http.StatusBadGateway)
+		return
+	}
+
+	p := &pendingQ{
+		id:       newAskID(),
+		msgID:    msgID,
+		answerCh: make(chan askResult, 1),
+		deadline: time.Now().Add(timeoutDur),
+	}
+	reg.add(p)
+	defer reg.remove(p)
+
+	for _, chatID := range subs[1:] {
+		if _, err := tg.SendWithKeyboard(chatID, body, req.Buttons); err != nil {
+			log.Printf("ask: extra-send failed for %d: %v", chatID, err)
+		}
+	}
+
+	start := time.Now()
+	timer := time.NewTimer(timeoutDur)
+	defer timer.Stop()
+
+	select {
+	case res := <-p.answerCh:
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"answer": res.answer,
+			"via":    res.via,
+			"ms":     time.Since(start).Milliseconds(),
+		})
+	case <-timer.C:
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusRequestTimeout)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error": "timeout",
+			"ms":    timeoutDur.Milliseconds(),
+		})
+	}
 }
 
 // --- CLI Send Mode ---
