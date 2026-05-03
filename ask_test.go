@@ -157,7 +157,7 @@ func (f *fakeTG) AnswerCallbackQuery(callbackID string) error {
 	return nil
 }
 
-func (f *fakeTG) EditMessageRemoveKeyboard(chatID, messageID int64) error {
+func (f *fakeTG) EditMessageWithAnswer(chatID, messageID int64, body, answer string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.editCalls[messageID] = true
