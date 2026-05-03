@@ -376,6 +376,40 @@ func (b *bucket) allow() bool {
 	return false
 }
 
+// --- Ask Request ---
+
+type askReq struct {
+	Text    string   `json:"text"`
+	Timeout int      `json:"timeout"`
+	Buttons []string `json:"buttons"`
+	Level   string   `json:"level"`
+	Title   string   `json:"title"`
+	Service string   `json:"service"`
+}
+
+func parseAskRequest(r *http.Request) (askReq, error) {
+	var req askReq
+	if r.Method == http.MethodPost {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			return req, err
+		}
+		return req, nil
+	}
+	// GET: pull from query string
+	q := r.URL.Query()
+	req.Text = q.Get("text")
+	req.Level = q.Get("level")
+	req.Title = q.Get("title")
+	req.Service = q.Get("service")
+	req.Buttons = q["button"]
+	if t := q.Get("timeout"); t != "" {
+		if v, err := strconv.Atoi(t); err == nil {
+			req.Timeout = v
+		}
+	}
+	return req, nil
+}
+
 // --- Ask Registry ---
 
 type askResult struct {
