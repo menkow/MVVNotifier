@@ -181,6 +181,59 @@ func (t *TG) Send(chatID int64, text string) error {
 	return err
 }
 
+// SendWithKeyboard sends an HTML-formatted message with optional inline buttons.
+// Each button's label is also its callback_data — keeps things simple.
+// Returns the message_id of the sent message (used for reply-to routing).
+func (t *TG) SendWithKeyboard(chatID int64, text string, buttons []string) (int64, error) {
+	payload := map[string]any{
+		"chat_id":    chatID,
+		"text":       text,
+		"parse_mode": "HTML",
+	}
+	if len(buttons) > 0 {
+		row := make([]map[string]string, 0, len(buttons))
+		for _, b := range buttons {
+			row = append(row, map[string]string{"text": b, "callback_data": b})
+		}
+		payload["reply_markup"] = map[string]any{
+			"inline_keyboard": [][]map[string]string{row},
+		}
+	}
+	raw, err := t.api("sendMessage", payload)
+	if err != nil {
+		return 0, err
+	}
+	var sent struct {
+		MessageID int64 `json:"message_id"`
+	}
+	if err := json.Unmarshal(raw, &sent); err != nil {
+		return 0, err
+	}
+	return sent.MessageID, nil
+}
+
+// AnswerCallbackQuery acknowledges a button press so Telegram stops the loading
+// spinner. Telegram requires this within 30 seconds.
+func (t *TG) AnswerCallbackQuery(callbackID string) error {
+	_, err := t.api("answerCallbackQuery", map[string]any{
+		"callback_query_id": callbackID,
+	})
+	return err
+}
+
+// EditMessageRemoveKeyboard rewrites the question message: replaces text with
+// finalText and removes any inline keyboard, so the user can't answer twice.
+func (t *TG) EditMessageRemoveKeyboard(chatID, messageID int64, finalText string) error {
+	_, err := t.api("editMessageText", map[string]any{
+		"chat_id":      chatID,
+		"message_id":   messageID,
+		"text":         finalText,
+		"parse_mode":   "HTML",
+		"reply_markup": map[string]any{"inline_keyboard": [][]any{}},
+	})
+	return err
+}
+
 type Update struct {
 	UpdateID      int64          `json:"update_id"`
 	Message       *Message       `json:"message"`
