@@ -396,8 +396,9 @@ func pollBot(tg *TG, store *Store) {
 }
 
 func handleNotify(w http.ResponseWriter, r *http.Request, tg *TG, store *Store, limiter *bucket) {
-	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"POST only"}`, http.StatusMethodNotAllowed)
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, `{"error":"GET or POST only"}`, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -410,9 +411,17 @@ func handleNotify(w http.ResponseWriter, r *http.Request, tg *TG, store *Store, 
 	}
 
 	var n Notification
-	if err := json.NewDecoder(r.Body).Decode(&n); err != nil {
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
-		return
+	if r.Method == http.MethodPost {
+		if err := json.NewDecoder(r.Body).Decode(&n); err != nil {
+			http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+			return
+		}
+	} else {
+		q := r.URL.Query()
+		n.Text = q.Get("text")
+		n.Title = q.Get("title")
+		n.Level = q.Get("level")
+		n.Service = q.Get("service")
 	}
 	if n.Text == "" {
 		http.Error(w, `{"error":"text is required"}`, http.StatusBadRequest)
