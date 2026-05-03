@@ -308,6 +308,7 @@ func main() {
 	cfg := loadConfig()
 	tg := NewTG(cfg.BotToken)
 	store := NewStore("subscribers.json")
+	notifyLimiter := newBucket(60, time.Second) // 60 req/min global, lazy refill
 
 	log.Printf("notify-bot starting on :%d (%d subscribers)", cfg.HTTPPort, store.Count())
 
@@ -317,7 +318,7 @@ func main() {
 	// HTTP server
 	mux := http.NewServeMux()
 	mux.HandleFunc("/notify", func(w http.ResponseWriter, r *http.Request) {
-		handleNotify(w, r, tg, store)
+		handleNotify(w, r, tg, store, notifyLimiter)
 	})
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
@@ -389,9 +390,17 @@ func pollBot(tg *TG, store *Store) {
 	}
 }
 
-func handleNotify(w http.ResponseWriter, r *http.Request, tg *TG, store *Store) {
+func handleNotify(w http.ResponseWriter, r *http.Request, tg *TG, store *Store, limiter *bucket) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"POST only"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !limiter.allow() {
+		w.Header().Set("Retry-After", "1")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":"rate limit exceeded","limit":"60/min"}`))
 		return
 	}
 
