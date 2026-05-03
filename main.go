@@ -87,8 +87,13 @@ func (s *Store) load() {
 	}
 }
 
+// save assumes the caller already holds s.mu. It must not call any other
+// Store method that locks, otherwise sync.RWMutex (non-reentrant) deadlocks.
 func (s *Store) save() {
-	ids := s.List()
+	ids := make([]int64, 0, len(s.subs))
+	for id := range s.subs {
+		ids = append(ids, id)
+	}
 	data, _ := json.Marshal(ids)
 	os.WriteFile(s.path, data, 0644)
 }
