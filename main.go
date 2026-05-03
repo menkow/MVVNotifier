@@ -285,7 +285,7 @@ func main() {
 	})
 
 	server := &http.Server{
-		Addr:    fmt.Sprintf("127.0.0.1:%d", cfg.HTTPPort),
+		Addr:    fmt.Sprintf(":%d", cfg.HTTPPort),
 		Handler: mux,
 	}
 
