@@ -460,15 +460,38 @@ type pendingQ struct {
 }
 
 type pendingRegistry struct {
-	mu    sync.Mutex
-	id2q  map[string]*pendingQ
-	msg2q map[int64]*pendingQ
+	mu       sync.Mutex
+	inflight int
+	cap      int
+	id2q     map[string]*pendingQ
+	msg2q    map[int64]*pendingQ
 }
 
 func newPendingRegistry() *pendingRegistry {
 	return &pendingRegistry{
+		cap:   5,
 		id2q:  make(map[string]*pendingQ),
 		msg2q: make(map[int64]*pendingQ),
+	}
+}
+
+// tryReserve atomically takes a slot in the cap. Returns false if the cap
+// is already saturated. Always pair with a deferred release().
+func (r *pendingRegistry) tryReserve() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.inflight >= r.cap {
+		return false
+	}
+	r.inflight++
+	return true
+}
+
+func (r *pendingRegistry) release() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.inflight > 0 {
+		r.inflight--
 	}
 }
 
@@ -765,12 +788,13 @@ func handleAsk(w http.ResponseWriter, r *http.Request, tg tgSender, store *Store
 		return
 	}
 
-	if reg.count() >= 5 {
+	if !reg.tryReserve() {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusTooManyRequests)
 		w.Write([]byte(`{"error":"too many concurrent questions","limit":5}`))
 		return
 	}
+	defer reg.release()
 
 	timeoutDur := clampTimeout(req.Timeout)
 
