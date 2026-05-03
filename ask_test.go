@@ -358,3 +358,47 @@ func TestRouteCallback_StaleAcksOnly(t *testing.T) {
 		t.Fatal("stale callback should not edit any message")
 	}
 }
+
+func TestRouteReply_Resolves(t *testing.T) {
+	reg := newPendingRegistry()
+	tg := newFakeTG()
+	p := &pendingQ{id: "x", msgID: 5555, answerCh: make(chan askResult, 1)}
+	reg.add(p)
+
+	msg := &Message{
+		MessageID:      6000,
+		Chat:           Chat{ID: 42},
+		Text:           "my answer",
+		ReplyToMessage: &ReplyMeta{MessageID: 5555},
+	}
+	if !routeReply(tg, reg, msg) {
+		t.Fatal("routeReply returned false on a matching reply")
+	}
+
+	select {
+	case res := <-p.answerCh:
+		if res.answer != "my answer" || res.via != "reply" {
+			t.Fatalf("res = %+v", res)
+		}
+	default:
+		t.Fatal("answer channel was not resolved")
+	}
+	if _, ok := tg.editFinals[5555]; !ok {
+		t.Fatal("EditMessageRemoveKeyboard not called for reply target")
+	}
+}
+
+func TestRouteReply_NoMatch_FallsThrough(t *testing.T) {
+	reg := newPendingRegistry()
+	tg := newFakeTG()
+
+	msg := &Message{
+		MessageID:      6000,
+		Chat:           Chat{ID: 42},
+		Text:           "hello",
+		ReplyToMessage: &ReplyMeta{MessageID: 9999},
+	}
+	if routeReply(tg, reg, msg) {
+		t.Fatal("routeReply should return false when no pending matches")
+	}
+}

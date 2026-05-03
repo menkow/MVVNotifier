@@ -593,6 +593,27 @@ func routeCallback(tg tgSender, reg *pendingRegistry, cq *CallbackQuery) {
 	)
 }
 
+// routeReply tries to resolve a pending /ask via reply-to. Returns true if
+// the message was consumed by the routing layer (and pollBot should `continue`).
+func routeReply(tg tgSender, reg *pendingRegistry, msg *Message) bool {
+	if msg.ReplyToMessage == nil {
+		return false
+	}
+	p := reg.byMsg(msg.ReplyToMessage.MessageID)
+	if p == nil {
+		return false
+	}
+	select {
+	case p.answerCh <- askResult{answer: msg.Text, via: "reply"}:
+	default:
+	}
+	_ = tg.EditMessageRemoveKeyboard(
+		msg.Chat.ID, msg.ReplyToMessage.MessageID,
+		fmt.Sprintf("✅ Answered: %s", escapeHTML(truncate(msg.Text, 80))),
+	)
+	return true
+}
+
 func pollBot(tg *TG, store *Store, asks *pendingRegistry) {
 	var offset int64
 	for {
@@ -613,6 +634,10 @@ func pollBot(tg *TG, store *Store, asks *pendingRegistry) {
 			}
 			chatID := u.Message.Chat.ID
 			cmd := strings.TrimSpace(u.Message.Text)
+
+			if routeReply(tg, asks, u.Message) {
+				continue
+			}
 
 			switch {
 			case cmd == "/start":
