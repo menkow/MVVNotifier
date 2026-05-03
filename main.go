@@ -223,14 +223,13 @@ func (t *TG) AnswerCallbackQuery(callbackID string) error {
 	return err
 }
 
-// EditMessageRemoveKeyboard rewrites the question message: replaces text with
-// finalText and removes any inline keyboard, so the user can't answer twice.
-func (t *TG) EditMessageRemoveKeyboard(chatID, messageID int64, finalText string) error {
-	_, err := t.api("editMessageText", map[string]any{
+// EditMessageRemoveKeyboard removes the inline keyboard from the question
+// message so the user can't answer twice. The original text is preserved
+// (we use editMessageReplyMarkup, not editMessageText).
+func (t *TG) EditMessageRemoveKeyboard(chatID, messageID int64) error {
+	_, err := t.api("editMessageReplyMarkup", map[string]any{
 		"chat_id":      chatID,
 		"message_id":   messageID,
-		"text":         finalText,
-		"parse_mode":   "HTML",
 		"reply_markup": map[string]any{"inline_keyboard": [][]any{}},
 	})
 	return err
@@ -242,7 +241,7 @@ func (t *TG) EditMessageRemoveKeyboard(chatID, messageID int64, finalText string
 type tgSender interface {
 	SendWithKeyboard(chatID int64, text string, buttons []string) (int64, error)
 	AnswerCallbackQuery(callbackID string) error
-	EditMessageRemoveKeyboard(chatID, messageID int64, finalText string) error
+	EditMessageRemoveKeyboard(chatID, messageID int64) error
 }
 
 type Update struct {
@@ -587,10 +586,7 @@ func routeCallback(tg tgSender, reg *pendingRegistry, cq *CallbackQuery) {
 	case p.answerCh <- askResult{answer: cq.Data, via: "button"}:
 	default:
 	}
-	_ = tg.EditMessageRemoveKeyboard(
-		cq.Message.Chat.ID, cq.Message.MessageID,
-		fmt.Sprintf("✅ Answered: %s", escapeHTML(cq.Data)),
-	)
+	_ = tg.EditMessageRemoveKeyboard(cq.Message.Chat.ID, cq.Message.MessageID)
 }
 
 // routeReply tries to resolve a pending /ask via reply-to. Returns true if
@@ -607,10 +603,7 @@ func routeReply(tg tgSender, reg *pendingRegistry, msg *Message) bool {
 	case p.answerCh <- askResult{answer: msg.Text, via: "reply"}:
 	default:
 	}
-	_ = tg.EditMessageRemoveKeyboard(
-		msg.Chat.ID, msg.ReplyToMessage.MessageID,
-		fmt.Sprintf("✅ Answered: %s", escapeHTML(truncate(msg.Text, 80))),
-	)
+	_ = tg.EditMessageRemoveKeyboard(msg.Chat.ID, msg.ReplyToMessage.MessageID)
 	return true
 }
 
@@ -629,10 +622,7 @@ func routeSequential(tg tgSender, reg *pendingRegistry, msg *Message) bool {
 	case p.answerCh <- askResult{answer: msg.Text, via: "text"}:
 	default:
 	}
-	_ = tg.EditMessageRemoveKeyboard(
-		msg.Chat.ID, p.msgID,
-		fmt.Sprintf("✅ Answered: %s", escapeHTML(truncate(msg.Text, 80))),
-	)
+	_ = tg.EditMessageRemoveKeyboard(msg.Chat.ID, p.msgID)
 	return true
 }
 

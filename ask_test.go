@@ -119,11 +119,11 @@ type fakeTG struct {
 	sendCalls  int
 	nextMsgID  int64
 	answerAcks []string
-	editFinals map[int64]string
+	editCalls  map[int64]bool
 }
 
 func newFakeTG() *fakeTG {
-	return &fakeTG{nextMsgID: 1000, editFinals: make(map[int64]string)}
+	return &fakeTG{nextMsgID: 1000, editCalls: make(map[int64]bool)}
 }
 
 func (f *fakeTG) SendWithKeyboard(chatID int64, text string, buttons []string) (int64, error) {
@@ -141,10 +141,10 @@ func (f *fakeTG) AnswerCallbackQuery(callbackID string) error {
 	return nil
 }
 
-func (f *fakeTG) EditMessageRemoveKeyboard(chatID, messageID int64, finalText string) error {
+func (f *fakeTG) EditMessageRemoveKeyboard(chatID, messageID int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.editFinals[messageID] = finalText
+	f.editCalls[messageID] = true
 	return nil
 }
 
@@ -335,7 +335,7 @@ func TestRouteCallback_Resolves(t *testing.T) {
 	if len(tg.answerAcks) != 1 || tg.answerAcks[0] != "cq1" {
 		t.Fatalf("answerAcks = %v", tg.answerAcks)
 	}
-	if _, ok := tg.editFinals[1234]; !ok {
+	if _, ok := tg.editCalls[1234]; !ok {
 		t.Fatal("EditMessageRemoveKeyboard not called")
 	}
 }
@@ -354,7 +354,7 @@ func TestRouteCallback_StaleAcksOnly(t *testing.T) {
 	if len(tg.answerAcks) != 1 {
 		t.Fatalf("stale callback should still be acked, got %v", tg.answerAcks)
 	}
-	if len(tg.editFinals) != 0 {
+	if len(tg.editCalls) != 0 {
 		t.Fatal("stale callback should not edit any message")
 	}
 }
@@ -383,7 +383,7 @@ func TestRouteReply_Resolves(t *testing.T) {
 	default:
 		t.Fatal("answer channel was not resolved")
 	}
-	if _, ok := tg.editFinals[5555]; !ok {
+	if _, ok := tg.editCalls[5555]; !ok {
 		t.Fatal("EditMessageRemoveKeyboard not called for reply target")
 	}
 }
