@@ -573,8 +573,27 @@ func main() {
 	}
 }
 
+func routeCallback(tg tgSender, reg *pendingRegistry, cq *CallbackQuery) {
+	if cq.Message == nil {
+		_ = tg.AnswerCallbackQuery(cq.ID)
+		return
+	}
+	p := reg.byMsg(cq.Message.MessageID)
+	_ = tg.AnswerCallbackQuery(cq.ID)
+	if p == nil {
+		return // stale button press
+	}
+	select {
+	case p.answerCh <- askResult{answer: cq.Data, via: "button"}:
+	default:
+	}
+	_ = tg.EditMessageRemoveKeyboard(
+		cq.Message.Chat.ID, cq.Message.MessageID,
+		fmt.Sprintf("✅ Answered: %s", escapeHTML(cq.Data)),
+	)
+}
+
 func pollBot(tg *TG, store *Store, asks *pendingRegistry) {
-	_ = asks // populated in tasks 7-9
 	var offset int64
 	for {
 		updates, err := tg.GetUpdates(offset)
@@ -585,6 +604,10 @@ func pollBot(tg *TG, store *Store, asks *pendingRegistry) {
 		}
 		for _, u := range updates {
 			offset = u.UpdateID + 1
+			if u.CallbackQuery != nil {
+				routeCallback(tg, asks, u.CallbackQuery)
+				continue
+			}
 			if u.Message == nil {
 				continue
 			}

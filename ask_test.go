@@ -307,3 +307,54 @@ func TestHandleAsk_AnswerPath(t *testing.T) {
 		t.Fatalf("registry not cleaned")
 	}
 }
+
+func TestRouteCallback_Resolves(t *testing.T) {
+	reg := newPendingRegistry()
+	tg := newFakeTG()
+	p := &pendingQ{id: "x", msgID: 1234, answerCh: make(chan askResult, 1)}
+	reg.add(p)
+
+	cq := &CallbackQuery{
+		ID:   "cq1",
+		Data: "Yes",
+		Message: &CallbackMessage{
+			MessageID: 1234,
+			Chat:      Chat{ID: 42},
+		},
+	}
+	routeCallback(tg, reg, cq)
+
+	select {
+	case res := <-p.answerCh:
+		if res.answer != "Yes" || res.via != "button" {
+			t.Fatalf("res = %+v", res)
+		}
+	default:
+		t.Fatal("answer channel was not resolved")
+	}
+	if len(tg.answerAcks) != 1 || tg.answerAcks[0] != "cq1" {
+		t.Fatalf("answerAcks = %v", tg.answerAcks)
+	}
+	if _, ok := tg.editFinals[1234]; !ok {
+		t.Fatal("EditMessageRemoveKeyboard not called")
+	}
+}
+
+func TestRouteCallback_StaleAcksOnly(t *testing.T) {
+	reg := newPendingRegistry()
+	tg := newFakeTG()
+
+	cq := &CallbackQuery{
+		ID:      "cq-stale",
+		Data:    "X",
+		Message: &CallbackMessage{MessageID: 9999, Chat: Chat{ID: 42}},
+	}
+	routeCallback(tg, reg, cq)
+
+	if len(tg.answerAcks) != 1 {
+		t.Fatalf("stale callback should still be acked, got %v", tg.answerAcks)
+	}
+	if len(tg.editFinals) != 0 {
+		t.Fatal("stale callback should not edit any message")
+	}
+}
