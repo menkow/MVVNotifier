@@ -223,13 +223,17 @@ func (t *TG) AnswerCallbackQuery(callbackID string) error {
 	return err
 }
 
-// EditMessageRemoveKeyboard removes the inline keyboard from the question
-// message so the user can't answer twice. The original text is preserved
-// (we use editMessageReplyMarkup, not editMessageText).
-func (t *TG) EditMessageRemoveKeyboard(chatID, messageID int64) error {
-	_, err := t.api("editMessageReplyMarkup", map[string]any{
+// EditMessageWithAnswer rewrites the question to show the original body
+// followed by an italic line with the user's answer, and removes the inline
+// keyboard. So in Telegram the user sees both what they were asked and what
+// they answered.
+func (t *TG) EditMessageWithAnswer(chatID, messageID int64, body, answer string) error {
+	finalText := body + "\n\n<i>✅ " + escapeHTML(answer) + "</i>"
+	_, err := t.api("editMessageText", map[string]any{
 		"chat_id":      chatID,
 		"message_id":   messageID,
+		"text":         finalText,
+		"parse_mode":   "HTML",
 		"reply_markup": map[string]any{"inline_keyboard": [][]any{}},
 	})
 	return err
@@ -241,7 +245,7 @@ func (t *TG) EditMessageRemoveKeyboard(chatID, messageID int64) error {
 type tgSender interface {
 	SendWithKeyboard(chatID int64, text string, buttons []string) (int64, error)
 	AnswerCallbackQuery(callbackID string) error
-	EditMessageRemoveKeyboard(chatID, messageID int64) error
+	EditMessageWithAnswer(chatID, messageID int64, body, answer string) error
 }
 
 type Update struct {
@@ -455,6 +459,7 @@ type askResult struct {
 type pendingQ struct {
 	id       string
 	msgID    int64
+	body     string // formatted question text — used to redraw on resolve so user sees question + answer
 	answerCh chan askResult
 	deadline time.Time
 }
@@ -609,7 +614,7 @@ func routeCallback(tg tgSender, reg *pendingRegistry, cq *CallbackQuery) {
 	case p.answerCh <- askResult{answer: cq.Data, via: "button"}:
 	default:
 	}
-	_ = tg.EditMessageRemoveKeyboard(cq.Message.Chat.ID, cq.Message.MessageID)
+	_ = tg.EditMessageWithAnswer(cq.Message.Chat.ID, cq.Message.MessageID, p.body, cq.Data)
 }
 
 // routeReply tries to resolve a pending /ask via reply-to. Returns true if
@@ -626,7 +631,7 @@ func routeReply(tg tgSender, reg *pendingRegistry, msg *Message) bool {
 	case p.answerCh <- askResult{answer: msg.Text, via: "reply"}:
 	default:
 	}
-	_ = tg.EditMessageRemoveKeyboard(msg.Chat.ID, msg.ReplyToMessage.MessageID)
+	_ = tg.EditMessageWithAnswer(msg.Chat.ID, msg.ReplyToMessage.MessageID, p.body, truncate(msg.Text, 80))
 	return true
 }
 
@@ -645,7 +650,7 @@ func routeSequential(tg tgSender, reg *pendingRegistry, msg *Message) bool {
 	case p.answerCh <- askResult{answer: msg.Text, via: "text"}:
 	default:
 	}
-	_ = tg.EditMessageRemoveKeyboard(msg.Chat.ID, p.msgID)
+	_ = tg.EditMessageWithAnswer(msg.Chat.ID, p.msgID, p.body, truncate(msg.Text, 80))
 	return true
 }
 
@@ -820,6 +825,7 @@ func handleAsk(w http.ResponseWriter, r *http.Request, tg tgSender, store *Store
 	p := &pendingQ{
 		id:       newAskID(),
 		msgID:    msgID,
+		body:     body,
 		answerCh: make(chan askResult, 1),
 		deadline: time.Now().Add(timeoutDur),
 	}
