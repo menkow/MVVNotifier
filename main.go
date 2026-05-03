@@ -182,15 +182,37 @@ func (t *TG) Send(chatID int64, text string) error {
 }
 
 type Update struct {
-	UpdateID int64 `json:"update_id"`
-	Message  *struct {
-		Chat struct {
-			ID        int64  `json:"id"`
-			FirstName string `json:"first_name"`
-			Username  string `json:"username"`
-		} `json:"chat"`
-		Text string `json:"text"`
-	} `json:"message"`
+	UpdateID      int64          `json:"update_id"`
+	Message       *Message       `json:"message"`
+	CallbackQuery *CallbackQuery `json:"callback_query"`
+}
+
+type Message struct {
+	MessageID      int64      `json:"message_id"`
+	Chat           Chat       `json:"chat"`
+	Text           string     `json:"text"`
+	ReplyToMessage *ReplyMeta `json:"reply_to_message"`
+}
+
+type Chat struct {
+	ID        int64  `json:"id"`
+	FirstName string `json:"first_name"`
+	Username  string `json:"username"`
+}
+
+type ReplyMeta struct {
+	MessageID int64 `json:"message_id"`
+}
+
+type CallbackQuery struct {
+	ID      string           `json:"id"`
+	Data    string           `json:"data"`
+	Message *CallbackMessage `json:"message"`
+}
+
+type CallbackMessage struct {
+	MessageID int64 `json:"message_id"`
+	Chat      Chat  `json:"chat"`
 }
 
 func (t *TG) GetUpdates(offset int64) ([]Update, error) {
