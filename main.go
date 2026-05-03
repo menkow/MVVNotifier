@@ -376,6 +376,79 @@ func (b *bucket) allow() bool {
 	return false
 }
 
+// --- Ask Registry ---
+
+type askResult struct {
+	answer string
+	via    string // "button" | "reply" | "text"
+}
+
+type pendingQ struct {
+	id       string
+	msgID    int64
+	answerCh chan askResult
+	deadline time.Time
+}
+
+type pendingRegistry struct {
+	mu    sync.Mutex
+	id2q  map[string]*pendingQ
+	msg2q map[int64]*pendingQ
+}
+
+func newPendingRegistry() *pendingRegistry {
+	return &pendingRegistry{
+		id2q:  make(map[string]*pendingQ),
+		msg2q: make(map[int64]*pendingQ),
+	}
+}
+
+func (r *pendingRegistry) add(p *pendingQ) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.id2q[p.id] = p
+	r.msg2q[p.msgID] = p
+}
+
+func (r *pendingRegistry) remove(p *pendingQ) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.id2q, p.id)
+	delete(r.msg2q, p.msgID)
+}
+
+func (r *pendingRegistry) byID(id string) *pendingQ {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.id2q[id]
+}
+
+func (r *pendingRegistry) byMsg(msgID int64) *pendingQ {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.msg2q[msgID]
+}
+
+func (r *pendingRegistry) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.id2q)
+}
+
+// onlyOne returns the sole pending question if there is exactly one,
+// otherwise nil. Used by the sequential-fallback path in pollBot.
+func (r *pendingRegistry) onlyOne() *pendingQ {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.id2q) != 1 {
+		return nil
+	}
+	for _, p := range r.id2q {
+		return p
+	}
+	return nil
+}
+
 // --- Main ---
 
 func main() {
